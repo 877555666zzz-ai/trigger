@@ -3,4 +3,4 @@ from sync import main
 
 while True:
     main()
-    time.sleep(60)
+    time.sleep(15)

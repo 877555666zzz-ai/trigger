@@ -2,6 +2,8 @@ import os
 import re
 import sys
 import json
+import time
+import hashlib
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -21,6 +23,9 @@ WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "22"))
 TZ = os.getenv("TZ", "Asia/Almaty")
 
 LOCK_FILE = os.getenv("LOCK_FILE", "/tmp/gs_sync.lock")
+
+# чтобы 5 сек не душили Google API — минимальный интервал записи в один и тот же DB лист
+MIN_WRITE_INTERVAL_SEC = int(os.getenv("MIN_WRITE_INTERVAL_SEC", "10"))
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -50,8 +55,15 @@ def col_to_a1(n: int) -> str:
 
 
 def is_valid_date_cell(v) -> bool:
+    # Google API часто отдаёт даты как строки (FORMATTED_STRING)
     if isinstance(v, str):
-        return bool(re.match(r"^\d{2}\.\d{2}\.\d{4}$", v.strip()))
+        s = v.strip()
+        # dd.MM.yyyy
+        if re.match(r"^\d{2}\.\d{2}\.\d{4}$", s):
+            return True
+        # yyyy-MM-dd (на всякий)
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+            return True
     return False
 
 
@@ -73,10 +85,6 @@ def safe_num(x):
 
 
 def get_service():
-    """
-    Railway: храним JSON сервис-аккаунта в переменной окружения GCP_SA_JSON (полный текст json).
-    Local: можно использовать файл через GOOGLE_APPLICATION_CREDENTIALS.
-    """
     sa_json = os.getenv("GCP_SA_JSON")
     if sa_json:
         info = json.loads(sa_json)
@@ -261,6 +269,32 @@ def build_db_result(source_values):
     return result, None
 
 
+def compute_hash(values) -> str:
+    # хэшируем результат (без влияния на логику)
+    s = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def state_path(sheet_name: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", sheet_name)
+    return f"/tmp/gs_state_{safe}.json"
+
+
+def read_state(sheet_name: str):
+    p = state_path(sheet_name)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def write_state(sheet_name: str, state: dict):
+    p = state_path(sheet_name)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+
 def should_sync_sheet(service, sheet_name: str, current_month: str) -> bool:
     db_name = f"DB_{sheet_name}"
     meta = get_spreadsheet_metadata(service, TARGET_SPREADSHEET_ID)
@@ -276,6 +310,7 @@ def should_sync_sheet(service, sheet_name: str, current_month: str) -> bool:
 def sync_one(service, sheet_name: str):
     db_name = f"DB_{sheet_name}"
 
+    # читаем исходник
     source_values = read_values(service, SOURCE_SPREADSHEET_ID, sheet_name)
     if not source_values:
         print(f"[SKIP] SOURCE лист не найден/пустой: {sheet_name}")
@@ -284,6 +319,21 @@ def sync_one(service, sheet_name: str):
     result, err = build_db_result(source_values)
     if err:
         print(f"[SKIP] {sheet_name}: {err}")
+        return
+
+    # быстрый SKIP если результат не менялся
+    new_hash = compute_hash(result)
+    st = read_state(db_name)
+    old_hash = st.get("hash")
+    last_write = float(st.get("last_write_ts", 0))
+
+    if old_hash == new_hash:
+        print(f"[INFO] NO-CHANGE: {sheet_name} (hash same) -> skip write")
+        return
+
+    # защита от слишком частых записей
+    if time.time() - last_write < MIN_WRITE_INTERVAL_SEC:
+        print(f"[INFO] THROTTLE: {sheet_name} (write too soon) -> skip this round")
         return
 
     ensure_sheet_exists(service, TARGET_SPREADSHEET_ID, db_name)
@@ -295,6 +345,8 @@ def sync_one(service, sheet_name: str):
 
     clear_sheet(service, TARGET_SPREADSHEET_ID, db_name)
     write_values(service, TARGET_SPREADSHEET_ID, write_range, result)
+
+    write_state(db_name, {"hash": new_hash, "last_write_ts": time.time()})
 
     print(f"[OK] SYNC: {sheet_name} -> {db_name} ({rows}x{cols})")
 
